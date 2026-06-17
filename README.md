@@ -170,3 +170,7 @@ Authorized Penetration Testing Tool — For use only on systems you own or have 
 Engine: Multi-threaded async socket architecture
 UI: Python curses (ncurses) — full terminal GUI
 Protocols: HTTP/1.1, HTTPS, TCP, UDP, Raw Sockets
+
+pkg update && pkg upgrade -y
+pkg install python ncurses -y
+pip install colorama
